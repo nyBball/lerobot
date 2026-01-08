@@ -44,10 +44,12 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.pi05.configuration_pi05 import DEFAULT_IMAGE_SIZE, PI05Config
 from lerobot.policies.pretrained import PreTrainedPolicy, T
 from lerobot.policies.rtc.modeling_rtc import RTCProcessor
+from lerobot.policies.utils import populate_queues
 from lerobot.utils.constants import (
     ACTION,
     OBS_LANGUAGE_ATTENTION_MASK,
     OBS_LANGUAGE_TOKENS,
+    OBS_STATE,
     OPENPI_ATTENTION_MASK_VALUE,
 )
 
@@ -445,7 +447,7 @@ class PaliGemmaWithExpertModel(
             adarms_cond = [None, None]
         if inputs_embeds[1] is None:
             prefix_output = self.paligemma.language_model.forward(
-                inputs_embeds=inputs_embeds[0],
+                inputs_embeds=inputs_embeds[0], # image:n_obs_step, image2:n_obs_step, task, state:n_obs_step, action
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
@@ -1108,9 +1110,12 @@ class PI05Policy(PreTrainedPolicy):
     def reset(self):
         """Reset internal state - called when environment resets."""
         self._action_queue = deque(maxlen=self.config.n_action_steps)
-        self._queues = {
-            ACTION: deque(maxlen=self.config.n_action_steps),
-        }
+        self._queues = {}
+        # Add observation queues for multi-step observations
+        if self.config.n_obs_steps > 1:
+            self._queues[OBS_STATE] = deque(maxlen=self.config.n_obs_steps)
+            for key in self.config.image_features:
+                self._queues[key] = deque(maxlen=self.config.n_obs_steps)
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
@@ -1132,7 +1137,11 @@ class PI05Policy(PreTrainedPolicy):
         """Preprocess images for the model.
 
         Images from LeRobot are typically in [B, C, H, W] format and normalized to [0, 1].
+        For n_obs_steps > 1, images come in [B, n_obs_steps, C, H, W] format.
         PaliGemma expects images in [B, C, H, W] format and normalized to [-1, 1].
+        
+        When n_obs_steps > 1, all observation steps are processed and returned as separate
+        images in the images list, so they are all embedded by SigLIP.
         """
         images = []
         img_masks = []
@@ -1161,38 +1170,56 @@ class PI05Policy(PreTrainedPolicy):
             if img.dtype != torch.float32:
                 img = img.to(torch.float32)
 
-            # from openpi preprocess_observation_pytorch: Handle both [B, C, H, W] and [B, H, W, C] formats
-            is_channels_first = img.shape[1] == 3  # Check if channels are in dimension 1
-
-            if is_channels_first:
-                # Convert [B, C, H, W] to [B, H, W, C] for processing
-                img = img.permute(0, 2, 3, 1)
-
-            # from openpi preprocess_observation_pytorch: Resize with padding if needed
-            if img.shape[1:3] != self.config.image_resolution:
-                img = resize_with_pad_torch(img, *self.config.image_resolution)
-
-            # Normalize from [0,1] to [-1,1] as expected by siglip
-            img = img * 2.0 - 1.0
-
-            # from openpi preprocess_observation_pytorch: Convert back to [B, C, H, W] format if it was originally channels-first
-            if is_channels_first:
-                img = img.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
-
-            images.append(img)
-            # Create mask (all ones for real images)
-            bsize = img.shape[0]
-            mask = torch.ones(bsize, dtype=torch.bool, device=device)
-            img_masks.append(mask)
+            # Handle multi-step observations: [B, n_obs_steps, C, H, W]
+            if img.dim() == 5:
+                batch_size, n_obs_steps = img.shape[:2]
+                # Process each observation step
+                for step_idx in range(n_obs_steps):
+                    step_img = img[:, step_idx]  # [B, C, H, W]
+                    step_img = self._preprocess_single_image(step_img, device)
+                    images.append(step_img)
+                    # Create mask (all ones for real images)
+                    mask = torch.ones(batch_size, dtype=torch.bool, device=device)
+                    img_masks.append(mask)
+            else:
+                # Single step observation: [B, C, H, W]
+                img = self._preprocess_single_image(img, device)
+                images.append(img)
+                # Create mask (all ones for real images)
+                bsize = img.shape[0]
+                mask = torch.ones(bsize, dtype=torch.bool, device=device)
+                img_masks.append(mask)
 
         # Create image features not present in the batch as fully 0 padded images
         for _num_empty_cameras in range(len(missing_img_keys)):
-            img = torch.ones_like(img) * -1  # Padded with -1 for SigLIP
-            mask = torch.zeros_like(mask)  # Mask is zero for empty cameras
+            img = torch.ones_like(images[-1]) * -1  # Padded with -1 for SigLIP
+            mask = torch.zeros(images[-1].shape[0], dtype=torch.bool, device=device)  # Mask is zero for empty cameras
             images.append(img)
             img_masks.append(mask)
 
         return images, img_masks
+
+    def _preprocess_single_image(self, img: Tensor, device: torch.device) -> Tensor:
+        """Preprocess a single image tensor [B, C, H, W] for SigLIP."""
+        # from openpi preprocess_observation_pytorch: Handle both [B, C, H, W] and [B, H, W, C] formats
+        is_channels_first = img.shape[1] == 3  # Check if channels are in dimension 1
+
+        if is_channels_first:
+            # Convert [B, C, H, W] to [B, H, W, C] for processing
+            img = img.permute(0, 2, 3, 1)
+
+        # from openpi preprocess_observation_pytorch: Resize with padding if needed
+        if img.shape[1:3] != self.config.image_resolution:
+            img = resize_with_pad_torch(img, *self.config.image_resolution)
+
+        # Normalize from [0,1] to [-1,1] as expected by siglip
+        img = img * 2.0 - 1.0
+
+        # from openpi preprocess_observation_pytorch: Convert back to [B, C, H, W] format if it was originally channels-first
+        if is_channels_first:
+            img = img.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
+
+        return img
 
     def prepare_action(self, batch):
         """Pad action"""
@@ -1208,9 +1235,26 @@ class PI05Policy(PreTrainedPolicy):
 
         self.eval()
 
+        # Handle multi-step observations
+        if self.config.n_obs_steps > 1:
+            # NOTE: for offline evaluation, we have action in the batch, so pop it
+            if ACTION in batch:
+                batch.pop(ACTION)
+            self._queues = populate_queues(self._queues, batch)
+
         # Action queue logic for n_action_steps > 1
         if len(self._action_queue) == 0:
-            actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
+            if self.config.n_obs_steps > 1:
+                # Stack observations from queue for multi-step input
+                stacked_batch = {}
+                for key in batch:
+                    if key in self._queues:
+                        stacked_batch[key] = torch.stack(list(self._queues[key]), dim=1)
+                    else:
+                        stacked_batch[key] = batch[key]
+                actions = self.predict_action_chunk(stacked_batch)[:, : self.config.n_action_steps]
+            else:
+                actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
             # Transpose to get shape (n_action_steps, batch_size, action_dim)
             self._action_queue.extend(actions.transpose(0, 1))
 

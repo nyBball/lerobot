@@ -68,20 +68,46 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
         # TODO: check if this necessary
         state = deepcopy(state)
 
-        # Prepare state (pad to max_state_dim)
-        state = pad_vector(state, self.max_state_dim)
+        # Handle multi-step observations: [B, n_obs_steps, state_dim]
+        if state.dim() == 3:
+            batch_size, n_obs_steps, state_dim = state.shape
+            # Process each observation step
+            all_discretized_states = []
+            for step_idx in range(n_obs_steps):
+                step_state = state[:, step_idx]  # [B, state_dim]
+                step_state = pad_vector(step_state, self.max_state_dim)
+                step_state_np = step_state.cpu().numpy()
+                discretized = np.digitize(step_state_np, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+                all_discretized_states.append(discretized)
+            
+            full_prompts = []
+            for i, task in enumerate(tasks):
+                cleaned_text = task.strip().replace("_", " ").replace("\n", " ")
+                # Concatenate all observation steps' states with separator
+                state_strs = []
+                for step_idx in range(n_obs_steps):
+                    state_str = " ".join(map(str, all_discretized_states[step_idx][i]))
+                    state_strs.append(state_str)
+                # Join all steps with semicolon separator
+                all_states_str = "; ".join(state_strs)
+                full_prompt = f"Task: {cleaned_text}, State: {all_states_str};\nAction: "
+                full_prompts.append(full_prompt)
+        else:
+            # Single step observation: [B, state_dim]
+            # Prepare state (pad to max_state_dim)
+            state = pad_vector(state, self.max_state_dim)
 
-        # State should already be normalized to [-1, 1] by the NormalizerProcessorStep that runs before this step
-        # Discretize into 256 bins (see openpi `PaligemmaTokenizer.tokenize()`)
-        state_np = state.cpu().numpy()
-        discretized_states = np.digitize(state_np, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+            # State should already be normalized to [-1, 1] by the NormalizerProcessorStep that runs before this step
+            # Discretize into 256 bins (see openpi `PaligemmaTokenizer.tokenize()`)
+            state_np = state.cpu().numpy()
+            discretized_states = np.digitize(state_np, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
 
-        full_prompts = []
-        for i, task in enumerate(tasks):
-            cleaned_text = task.strip().replace("_", " ").replace("\n", " ")
-            state_str = " ".join(map(str, discretized_states[i]))
-            full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
-            full_prompts.append(full_prompt)
+            full_prompts = []
+            for i, task in enumerate(tasks):
+                cleaned_text = task.strip().replace("_", " ").replace("\n", " ")
+                state_str = " ".join(map(str, discretized_states[i]))
+                full_prompt = f"Task: {cleaned_text}, State: {state_str};\nAction: "
+                full_prompts.append(full_prompt)
 
         transition[TransitionKey.COMPLEMENTARY_DATA][self.task_key] = full_prompts
         # Normalize state to [-1, 1] range if needed (assuming it's already normalized by normalizer processor step!!)
