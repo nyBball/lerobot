@@ -126,9 +126,14 @@ def make_att_2d_masks(pad_masks, att_masks):  # see openpi `make_att_2d_masks` (
     if pad_masks.ndim != 2:
         raise ValueError(pad_masks.ndim)
 
-    cumsum = torch.cumsum(att_masks, dim=1)
+    # Ensure att_masks is int32 for cumsum operation
+    if att_masks.dtype == torch.bool:
+        att_masks = att_masks.to(torch.int32)
+    cumsum = torch.cumsum(att_masks.to(torch.int32), dim=1)
     att_2d_masks = cumsum[:, None, :] <= cumsum[:, :, None]
-    pad_2d_masks = pad_masks[:, None, :] * pad_masks[:, :, None]
+    # Ensure pad_masks is bool for proper boolean operations
+    pad_masks_bool = pad_masks.to(torch.bool) if pad_masks.dtype != torch.bool else pad_masks
+    pad_2d_masks = pad_masks_bool[:, None, :] & pad_masks_bool[:, :, None]
     return att_2d_masks & pad_2d_masks
 
 
@@ -615,7 +620,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
     def _prepare_attention_masks_4d(self, att_2d_masks):
         """Helper method to prepare 4D attention masks for transformer."""
         att_2d_masks_4d = att_2d_masks[:, None, :, :]
-        return torch.where(att_2d_masks_4d, 0.0, OPENPI_ATTENTION_MASK_VALUE)
+        # Use float32 for attention masks to ensure proper gradient computation
+        return torch.where(att_2d_masks_4d, torch.tensor(0.0, dtype=torch.float32, device=att_2d_masks.device), 
+                          torch.tensor(OPENPI_ATTENTION_MASK_VALUE, dtype=torch.float32, device=att_2d_masks.device))
 
     def sample_noise(self, shape, device):
         return torch.normal(
@@ -669,7 +676,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
-        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
+        att_masks = torch.tensor(att_masks, dtype=torch.int32, device=pad_masks.device)
 
         bsize = pad_masks.shape[0]
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
@@ -718,7 +725,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
-        att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
+        att_masks = torch.tensor(att_masks, dtype=torch.int32, device=embs.device)
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
 
         return embs, pad_masks, att_masks, adarms_cond
@@ -749,7 +756,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
 
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+        # Ensure position_ids is int64 for proper CUDA indexing operations
+        position_ids = torch.cumsum(pad_masks.to(torch.int64), dim=1) - 1
 
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
