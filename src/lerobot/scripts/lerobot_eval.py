@@ -537,6 +537,8 @@ def eval_main(cfg: EvalPipelineConfig):
     preprocessor_overrides = {
         "device_processor": {"device": str(policy.config.device)},
         "rename_observations_processor": {"rename_map": cfg.rename_map},
+        # Disable queue filling augmentation during inference (only used during training)
+        "pi05_queue_filling_augmentation": {"aug_prob": 0.0},
     }
 
     preprocessor, postprocessor = make_pre_post_processors(

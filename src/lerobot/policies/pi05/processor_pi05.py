@@ -58,6 +58,9 @@ class Pi05QueueFillingAugmentationStep(ProcessorStep):
     
     When enabled, all historical observation frames (state and images) are replaced with
     the current frame, simulating the "queue not yet filled" scenario.
+    
+    Note: This augmentation should be disabled during inference by setting aug_prob=0.
+    The lerobot_eval.py script does this automatically via preprocessor_overrides.
     """
     
     aug_prob: float = 0.0  # Probability of applying augmentation (0.0 = disabled)
