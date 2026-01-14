@@ -34,7 +34,6 @@ class PI05Config(PreTrainedConfig):
 
     n_obs_steps: int = 1
     obs_frame_interval: int = 1  # Interval between observation frames (e.g., 5 means use every 5th frame)
-    queue_filling_aug_prob: float = 0.0  # Probability of simulating queue filling during training (0.0 = disabled)
     chunk_size: int = 50  # Number of action steps to predict, in openpi called "action_horizon"
     n_action_steps: int = 50  # Number of action steps to execute
 
