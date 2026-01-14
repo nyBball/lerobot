@@ -1112,13 +1112,9 @@ class PI05Policy(PreTrainedPolicy):
         self._action_queue = deque(maxlen=self.config.n_action_steps)
         self._queues = {}
         if self.config.n_obs_steps > 1:
-            # Calculate queue size to support interval-based frame selection
-            # For n_obs_steps=4, obs_frame_interval=5, we need frames at -15, -10, -5, 0
-            # So we need to store at least 16 frames (indices 0 to 15 from oldest)
-            queue_size = (self.config.n_obs_steps - 1) * self.config.obs_frame_interval + 1
-            self._queues[OBS_STATE] = deque(maxlen=queue_size)
+            self._queues[OBS_STATE]=deque(maxlen=self.config.n_obs_steps)
             for key in self.config.image_features:
-                self._queues[key] = deque(maxlen=queue_size)
+                self._queues[key] = deque(maxlen=self.config.n_obs_steps)
 
     def init_rtc_processor(self):
         """Initialize RTC processor if RTC is enabled in config."""
@@ -1251,19 +1247,11 @@ class PI05Policy(PreTrainedPolicy):
         # Action queue logic for n_action_steps > 1
         if len(self._action_queue) == 0:
             if self.config.n_obs_steps > 1:
-                # Stack observations from queue at interval positions for multi-step input
-                # For n_obs_steps=4, obs_frame_interval=5, queue has 16 frames
-                # We sample at indices [0, 5, 10, 15] (from oldest to newest)
+                # Stack observations from queue for multi-step input
                 stacked_batch = {}
-                interval = self.config.obs_frame_interval
-                # Calculate sampling indices: [0, interval, 2*interval, ..., (n_obs_steps-1)*interval]
-                sample_indices = [i * interval for i in range(self.config.n_obs_steps)]
                 for key in batch:
                     if key in self._queues:
-                        queue_list = list(self._queues[key])
-                        # Sample frames at interval positions
-                        sampled_frames = [queue_list[idx] for idx in sample_indices]
-                        stacked_batch[key] = torch.stack(sampled_frames, dim=1)
+                        stacked_batch[key] = torch.stack(list(self._queues[key]), dim=1)
                     else:
                         stacked_batch[key] = batch[key]
                 actions = self.predict_action_chunk(stacked_batch)[:, : self.config.n_action_steps]

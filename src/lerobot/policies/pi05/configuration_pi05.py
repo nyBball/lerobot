@@ -33,6 +33,7 @@ class PI05Config(PreTrainedConfig):
     dtype: str = "float32"  # Options: "bfloat16", "float32"
 
     n_obs_steps: int = 1
+    obs_frame_interval: int = 1  # Interval between observation frames (e.g., 5 means use every 5th frame)
     chunk_size: int = 50  # Number of action steps to predict, in openpi called "action_horizon"
     n_action_steps: int = 50  # Number of action steps to execute
 
@@ -157,9 +158,17 @@ class PI05Config(PreTrainedConfig):
 
     @property
     def observation_delta_indices(self) -> list[int] | None:
+        """Returns frame indices for multi-step observations with interval support.
+        
+        Examples:
+            n_obs_steps=1 -> None (single frame, no delta needed)
+            n_obs_steps=3, obs_frame_interval=1 -> [-2, -1, 0] (consecutive frames)
+            n_obs_steps=5, obs_frame_interval=5 -> [-20, -15, -10, -5, 0] (every 5th frame)
+        """
         if self.n_obs_steps == 1:
             return None
-        return list(range(1 - self.n_obs_steps, 1))
+        # Generate indices with interval: [-(n_obs_steps-1)*interval, ..., -interval, 0]
+        return [-(self.n_obs_steps - 1 - i) * self.obs_frame_interval for i in range(self.n_obs_steps)]
 
     @property
     def action_delta_indices(self) -> list:
