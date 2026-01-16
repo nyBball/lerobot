@@ -45,6 +45,34 @@ from lerobot.utils.constants import (
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
 
+# Key for storing normalized state before tokenization (for multi-step inference)
+NORMALIZED_STATE_KEY = "_normalized_state_for_queue"
+
+@ProcessorStepRegistry.register(name="pi05_preserve_normalized_state_processor_step")
+@dataclass
+class Pi05PreserveNormalizedStateProcessorStep(ProcessorStep):
+    """
+    Preserve normalized state before tokenization for multi-step inference.
+    
+    This step copies the normalized state to a special key so that it can be
+    stored in queues during inference. After stacking multi-frame observations,
+    the stacked state will be re-tokenized.
+    """
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        transition = transition.copy()
+        state = transition.get(TransitionKey.OBSERVATION, {}).get(OBS_STATE)
+        if state is not None:
+            # Store a copy of normalized state before tokenization
+            # This will be used in select_action for multi-step observation stacking
+            transition[TransitionKey.OBSERVATION][NORMALIZED_STATE_KEY] = state.clone()
+        return transition
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        """This step does not alter the feature definitions."""
+        return features
 
 @ProcessorStepRegistry.register(name="pi05_queue_filling_augmentation")
 @dataclass

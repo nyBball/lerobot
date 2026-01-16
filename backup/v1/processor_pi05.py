@@ -15,7 +15,8 @@
 # limitations under the License.
 
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import random
 from typing import Any
 
 import numpy as np
@@ -47,7 +48,6 @@ from lerobot.utils.constants import (
 # Key for storing normalized state before tokenization (for multi-step inference)
 NORMALIZED_STATE_KEY = "_normalized_state_for_queue"
 
-
 @ProcessorStepRegistry.register(name="pi05_preserve_normalized_state_processor_step")
 @dataclass
 class Pi05PreserveNormalizedStateProcessorStep(ProcessorStep):
@@ -73,6 +73,66 @@ class Pi05PreserveNormalizedStateProcessorStep(ProcessorStep):
     ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
         """This step does not alter the feature definitions."""
         return features
+
+@ProcessorStepRegistry.register(name="pi05_queue_filling_augmentation")
+@dataclass
+class Pi05QueueFillingAugmentationStep(ProcessorStep):
+    """
+    Simulates inference-time queue filling during training.
+    
+    During inference, when an episode starts, the observation queue is filled by repeating
+    the first frame. This augmentation randomly applies the same behavior during training
+    to make the model robust to this pattern.
+    
+    When enabled, all historical observation frames (state and images) are replaced with
+    the current frame, simulating the "queue not yet filled" scenario.
+    
+    Note: This augmentation should be disabled during inference by setting aug_prob=0.
+    The lerobot_eval.py script does this automatically via preprocessor_overrides.
+    """
+    
+    aug_prob: float = 0.0  # Probability of applying augmentation (0.0 = disabled)
+    n_obs_steps: int = 1  # Number of observation steps
+    image_feature_keys: list[str] = field(default_factory=list)  # Keys for image features
+    
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        # Skip if augmentation is disabled or single-step observations
+        if self.aug_prob <= 0.0 or self.n_obs_steps <= 1:
+            return transition
+        
+        # Apply augmentation with probability aug_prob
+        if random.random() >= self.aug_prob:
+            return transition
+        
+        transition = transition.copy()
+        observations = transition.get(TransitionKey.OBSERVATION, {})
+        
+        # Process state: replace historical frames with current frame
+        state = observations.get(OBS_STATE)
+        if state is not None and state.dim() == 3:  # [B, n_obs_steps, state_dim]
+            # Copy the last frame (current frame) to all positions
+            current_frame = state[:, -1:, :]  # [B, 1, state_dim]
+            augmented_state = current_frame.expand_as(state).clone()
+            observations[OBS_STATE] = augmented_state
+        
+        # Process image features: replace historical frames with current frame
+        for img_key in self.image_feature_keys:
+            img = observations.get(img_key)
+            if img is not None and img.dim() == 5:  # [B, n_obs_steps, C, H, W]
+                # Copy the last frame (current frame) to all positions
+                current_frame = img[:, -1:, :, :, :]  # [B, 1, C, H, W]
+                augmented_img = current_frame.expand_as(img).clone()
+                observations[img_key] = augmented_img
+        
+        transition[TransitionKey.OBSERVATION] = observations
+        return transition
+    
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        """This step does not alter the feature definitions."""
+        return features
+
 
 
 @ProcessorStepRegistry.register(name="pi05_prepare_state_tokenizer_processor_step")
@@ -161,33 +221,44 @@ def make_pi05_pre_post_processors(
     PolicyProcessorPipeline[PolicyAction, PolicyAction],
 ]:
     """
-    Constructs pre-processor and post-processor pipelines for the PI05 policy.
+    Constructs pre-processor and post-processor pipelines for the PI0 policy.
 
     The pre-processing pipeline prepares input data for the model by:
     1. Renaming features to match pretrained configurations.
     2. Normalizing input and output features based on dataset statistics.
     3. Adding a batch dimension.
-    4. Preserving normalized state for multi-step inference queue.
-    5. Preparing state and tokenizing the text prompt.
-    6. Tokenizing the text prompt using the PaliGemma tokenizer.
-    7. Moving all data to the specified device.
+    4. Appending a newline character to the task description for tokenizer compatibility.
+    5. Tokenizing the text prompt using the PaliGemma tokenizer.
+    6. Moving all data to the specified device.
 
     The post-processing pipeline handles the model's output by:
     1. Moving data to the CPU.
     2. Unnormalizing the output features to their original scale.
 
     Args:
-        config: The configuration object for the PI05 policy.
+        config: The configuration object for the PI0 policy.
         dataset_stats: A dictionary of statistics for normalization.
+        preprocessor_kwargs: Additional arguments for the pre-processor pipeline.
+        postprocessor_kwargs: Additional arguments for the post-processor pipeline.
 
     Returns:
         A tuple containing the configured pre-processor and post-processor pipelines.
     """
 
+    # Extract image feature keys from config for augmentation
+    image_feature_keys = [k for k, v in config.input_features.items() if "image" in k.lower()]
+    
     # Add remaining processors
     input_steps: list[ProcessorStep] = [
         RenameObservationsProcessorStep(rename_map={}),  # To mimic the same processor as pretrained one
         AddBatchDimensionProcessorStep(),
+        # Queue filling augmentation: simulates inference-time queue filling during training
+        # Must come before normalization to work on raw observations
+        Pi05QueueFillingAugmentationStep(
+            aug_prob=config.queue_filling_aug_prob,
+            n_obs_steps=config.n_obs_steps,
+            image_feature_keys=image_feature_keys,
+        ),
         # NOTE: NormalizerProcessorStep MUST come before Pi05PrepareStateTokenizerProcessorStep
         # because the tokenizer step expects normalized state in [-1, 1] range for discretization
         NormalizerProcessorStep(
@@ -195,8 +266,6 @@ def make_pi05_pre_post_processors(
             norm_map=config.normalization_mapping,
             stats=dataset_stats,
         ),
-        # Preserve normalized state BEFORE tokenization for multi-step inference
-        Pi05PreserveNormalizedStateProcessorStep(),
         Pi05PrepareStateTokenizerProcessorStep(max_state_dim=config.max_state_dim),
         TokenizerProcessorStep(
             tokenizer_name="google/paligemma-3b-pt-224",

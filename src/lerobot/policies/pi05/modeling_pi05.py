@@ -53,6 +53,10 @@ from lerobot.utils.constants import (
     OPENPI_ATTENTION_MASK_VALUE,
 )
 
+# Key for storing normalized state before tokenization (for multi-step inference)
+# This must match the key defined in processor_pi05.py
+NORMALIZED_STATE_KEY = "_normalized_state_for_queue"
+
 
 class ActionSelectKwargs(TypedDict, total=False):
     inference_delay: int | None
@@ -1266,6 +1270,12 @@ class PI05Policy(PreTrainedPolicy):
                         stacked_batch[key] = torch.stack(sampled_frames, dim=1)
                     else:
                         stacked_batch[key] = batch[key]
+
+                # Re-tokenize with multi-frame states for proper inference
+                # When n_obs_steps > 1, we need to create a new prompt with all stacked states
+                if NORMALIZED_STATE_KEY in self._queues and len(self._queues[NORMALIZED_STATE_KEY]) > 0:
+                    stacked_batch = self._retokenize_multi_step_states(stacked_batch, sample_indices)
+
                 actions = self.predict_action_chunk(stacked_batch)[:, : self.config.n_action_steps]
             else:
                 actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
@@ -1273,6 +1283,114 @@ class PI05Policy(PreTrainedPolicy):
             self._action_queue.extend(actions.transpose(0, 1))
 
         return self._action_queue.popleft()
+    
+    def _retokenize_multi_step_states(self, stacked_batch: dict[str, Tensor], sample_indices: list[int]) -> dict[str, Tensor]:
+        """Re-tokenize the prompt with multi-frame states for proper inference.
+        
+        When n_obs_steps > 1, the preprocessor tokenizes single-frame states into the prompt.
+        This method re-creates the prompt with all stacked states so the model sees
+        the same input format as during training.
+        
+        Args:
+            stacked_batch: Batch with stacked observations
+            sample_indices: Indices used to sample from queues
+            
+        Returns:
+            Updated batch with re-tokenized prompt containing all frame states
+        """
+        import re
+        import numpy as np
+        from transformers import AutoTokenizer
+        
+        # Get the stacked normalized states from the queue
+        queue_list = list(self._queues[NORMALIZED_STATE_KEY])
+        sampled_states = [queue_list[idx] for idx in sample_indices]
+        stacked_states = torch.stack(sampled_states, dim=1)  # [B, n_obs_steps, state_dim]
+        
+        # Get task from batch (should be in complementary data or a special key)
+        task_key = "task"
+        if task_key not in stacked_batch:
+            # If task is not in batch, we cannot re-tokenize
+            return stacked_batch
+        
+        tasks = stacked_batch[task_key]
+        if not isinstance(tasks, list):
+            if hasattr(tasks, 'tolist'):
+                tasks = tasks.tolist()
+            else:
+                tasks = [tasks]
+        
+        # Prepare multi-frame state prompt (same logic as Pi05PrepareStateTokenizerProcessorStep)
+        batch_size, n_obs_steps, state_dim = stacked_states.shape
+        device = stacked_states.device
+        
+        # Pad states to max_state_dim
+        max_state_dim = self.config.max_state_dim
+        if state_dim < max_state_dim:
+            padding = torch.zeros(batch_size, n_obs_steps, max_state_dim - state_dim, device=device)
+            stacked_states = torch.cat([stacked_states, padding], dim=-1)
+        
+        # Discretize each frame's state
+        all_discretized_states = []
+        for step_idx in range(n_obs_steps):
+            step_state = stacked_states[:, step_idx]  # [B, max_state_dim]
+            step_state_np = step_state.cpu().numpy()
+            discretized = np.digitize(step_state_np, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
+            all_discretized_states.append(discretized)
+
+        def extract_task_description(input_string):
+            """
+            Extracts the task description from a string with format:
+            "Task: <description>, State: <numbers>, Action:"
+            """
+            # Method 1: Using regex
+            pattern = r'Task:\s*(.*?),\s*State:'
+            match = re.search(pattern, input_string)
+            if match:
+                return match.group(1).strip()
+            
+            # Method 2: Using string splitting (fallback)
+            try:
+                task_part = input_string.split("Task: ")[1].split(", State:")[0]
+                return task_part.strip()
+            except (IndexError, AttributeError):
+                return None
+        
+        # Build prompts with all frames' states
+        full_prompts = []
+        for i, task in enumerate(tasks):
+            if isinstance(task, str):
+                cleaned_text = task.strip().replace("_", " ").replace("\n", " ")
+            else:
+                cleaned_text = str(task)
+
+            cleaned_text = extract_task_description(cleaned_text)
+            
+            # Concatenate all observation steps' states with separator
+            state_strs = []
+            for step_idx in range(n_obs_steps):
+                state_str = " ".join(map(str, all_discretized_states[step_idx][i]))
+                state_strs.append(state_str)
+            all_states_str = "; ".join(state_strs)
+
+            full_prompt = f"Task: {cleaned_text}, State: {all_states_str};\nAction: "
+            full_prompts.append(full_prompt)
+        
+        # Re-tokenize the prompts
+        tokenizer = AutoTokenizer.from_pretrained("/home/ma-user/work/nieying/ckpt/paligemma-3b-pt-224")
+        tokenized = tokenizer(
+            full_prompts,
+            max_length=self.config.tokenizer_max_length, #200
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        )
+        
+        # Update batch with new tokens
+        stacked_batch[OBS_LANGUAGE_TOKENS] = tokenized["input_ids"].to(device)
+        stacked_batch[OBS_LANGUAGE_ATTENTION_MASK] = tokenized["attention_mask"].to(device).to(dtype=torch.bool)
+        
+        return stacked_batch
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], **kwargs: Unpack[ActionSelectKwargs]) -> Tensor:

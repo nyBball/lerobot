@@ -130,14 +130,9 @@ def make_att_2d_masks(pad_masks, att_masks):  # see openpi `make_att_2d_masks` (
     if pad_masks.ndim != 2:
         raise ValueError(pad_masks.ndim)
 
-    # Ensure att_masks is int32 for cumsum operation
-    if att_masks.dtype == torch.bool:
-        att_masks = att_masks.to(torch.int32)
-    cumsum = torch.cumsum(att_masks.to(torch.int32), dim=1)
+    cumsum = torch.cumsum(att_masks, dim=1)
     att_2d_masks = cumsum[:, None, :] <= cumsum[:, :, None]
-    # Ensure pad_masks is bool for proper boolean operations
-    pad_masks_bool = pad_masks.to(torch.bool) if pad_masks.dtype != torch.bool else pad_masks
-    pad_2d_masks = pad_masks_bool[:, None, :] & pad_masks_bool[:, :, None]
+    pad_2d_masks = pad_masks[:, None, :] * pad_masks[:, :, None]
     return att_2d_masks & pad_2d_masks
 
 
@@ -456,7 +451,7 @@ class PaliGemmaWithExpertModel(
             adarms_cond = [None, None]
         if inputs_embeds[1] is None:
             prefix_output = self.paligemma.language_model.forward(
-                inputs_embeds=inputs_embeds[0], # image:n_obs_step, image2:n_obs_step, task, state:n_obs_step, action
+                inputs_embeds=inputs_embeds[0],
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
@@ -624,9 +619,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
     def _prepare_attention_masks_4d(self, att_2d_masks):
         """Helper method to prepare 4D attention masks for transformer."""
         att_2d_masks_4d = att_2d_masks[:, None, :, :]
-        # Use float32 for attention masks to ensure proper gradient computation
-        return torch.where(att_2d_masks_4d, torch.tensor(0.0, dtype=torch.float32, device=att_2d_masks.device), 
-                          torch.tensor(OPENPI_ATTENTION_MASK_VALUE, dtype=torch.float32, device=att_2d_masks.device))
+        return torch.where(att_2d_masks_4d, 0.0, OPENPI_ATTENTION_MASK_VALUE)
 
     def sample_noise(self, shape, device):
         return torch.normal(
@@ -680,7 +673,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
-        att_masks = torch.tensor(att_masks, dtype=torch.int32, device=pad_masks.device)
+        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
 
         bsize = pad_masks.shape[0]
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
@@ -729,7 +722,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
-        att_masks = torch.tensor(att_masks, dtype=torch.int32, device=embs.device)
+        att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
 
         return embs, pad_masks, att_masks, adarms_cond
@@ -760,8 +753,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
 
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-        # Ensure position_ids is int64 for proper CUDA indexing operations
-        position_ids = torch.cumsum(pad_masks.to(torch.int64), dim=1) - 1
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
 
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
@@ -1129,8 +1121,6 @@ class PI05Policy(PreTrainedPolicy):
             # So we need to store at least 16 frames (indices 0 to 15 from oldest)
             queue_size = (self.config.n_obs_steps - 1) * self.config.obs_frame_interval + 1
             self._queues[OBS_STATE] = deque(maxlen=queue_size)
-            # Add queue for normalized state (for re-tokenization after stacking)
-            self._queues[NORMALIZED_STATE_KEY] = deque(maxlen=queue_size)
             for key in self.config.image_features:
                 self._queues[key] = deque(maxlen=queue_size)
 
@@ -1150,6 +1140,7 @@ class PI05Policy(PreTrainedPolicy):
     def _rtc_enabled(self) -> bool:
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
 
+    
     def _preprocess_images(self, batch: dict[str, Tensor]) -> tuple[list[Tensor], list[Tensor]]:
         """Preprocess images for the model.
 
@@ -1216,6 +1207,7 @@ class PI05Policy(PreTrainedPolicy):
 
         return images, img_masks
 
+
     def _preprocess_single_image(self, img: Tensor, device: torch.device) -> Tensor:
         """Preprocess a single image tensor [B, C, H, W] for SigLIP."""
         # from openpi preprocess_observation_pytorch: Handle both [B, C, H, W] and [B, H, W, C] formats
@@ -1237,6 +1229,7 @@ class PI05Policy(PreTrainedPolicy):
             img = img.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
 
         return img
+
 
     def prepare_action(self, batch):
         """Pad action"""
@@ -1277,11 +1270,12 @@ class PI05Policy(PreTrainedPolicy):
                         stacked_batch[key] = torch.stack(sampled_frames, dim=1)
                     else:
                         stacked_batch[key] = batch[key]
+
                 # Re-tokenize with multi-frame states for proper inference
                 # When n_obs_steps > 1, we need to create a new prompt with all stacked states
                 if NORMALIZED_STATE_KEY in self._queues and len(self._queues[NORMALIZED_STATE_KEY]) > 0:
                     stacked_batch = self._retokenize_multi_step_states(stacked_batch, sample_indices)
-                
+
                 actions = self.predict_action_chunk(stacked_batch)[:, : self.config.n_action_steps]
             else:
                 actions = self.predict_action_chunk(batch)[:, : self.config.n_action_steps]
@@ -1289,10 +1283,8 @@ class PI05Policy(PreTrainedPolicy):
             self._action_queue.extend(actions.transpose(0, 1))
 
         return self._action_queue.popleft()
-
-    def _retokenize_multi_step_states(
-        self, stacked_batch: dict[str, Tensor], sample_indices: list[int]
-    ) -> dict[str, Tensor]:
+    
+    def _retokenize_multi_step_states(self, stacked_batch: dict[str, Tensor], sample_indices: list[int]) -> dict[str, Tensor]:
         """Re-tokenize the prompt with multi-frame states for proper inference.
         
         When n_obs_steps > 1, the preprocessor tokenizes single-frame states into the prompt.
@@ -1306,6 +1298,7 @@ class PI05Policy(PreTrainedPolicy):
         Returns:
             Updated batch with re-tokenized prompt containing all frame states
         """
+        import re
         import numpy as np
         from transformers import AutoTokenizer
         
@@ -1344,6 +1337,24 @@ class PI05Policy(PreTrainedPolicy):
             step_state_np = step_state.cpu().numpy()
             discretized = np.digitize(step_state_np, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
             all_discretized_states.append(discretized)
+
+        def extract_task_description(input_string):
+            """
+            Extracts the task description from a string with format:
+            "Task: <description>, State: <numbers>, Action:"
+            """
+            # Method 1: Using regex
+            pattern = r'Task:\s*(.*?),\s*State:'
+            match = re.search(pattern, input_string)
+            if match:
+                return match.group(1).strip()
+            
+            # Method 2: Using string splitting (fallback)
+            try:
+                task_part = input_string.split("Task: ")[1].split(", State:")[0]
+                return task_part.strip()
+            except (IndexError, AttributeError):
+                return None
         
         # Build prompts with all frames' states
         full_prompts = []
@@ -1352,6 +1363,8 @@ class PI05Policy(PreTrainedPolicy):
                 cleaned_text = task.strip().replace("_", " ").replace("\n", " ")
             else:
                 cleaned_text = str(task)
+
+            cleaned_text = extract_task_description(cleaned_text)
             
             # Concatenate all observation steps' states with separator
             state_strs = []
@@ -1359,14 +1372,15 @@ class PI05Policy(PreTrainedPolicy):
                 state_str = " ".join(map(str, all_discretized_states[step_idx][i]))
                 state_strs.append(state_str)
             all_states_str = "; ".join(state_strs)
+
             full_prompt = f"Task: {cleaned_text}, State: {all_states_str};\nAction: "
             full_prompts.append(full_prompt)
         
         # Re-tokenize the prompts
-        tokenizer = AutoTokenizer.from_pretrained("google/paligemma-3b-pt-224")
+        tokenizer = AutoTokenizer.from_pretrained("/home/ma-user/work/nieying/ckpt/paligemma-3b-pt-224")
         tokenized = tokenizer(
             full_prompts,
-            max_length=self.config.tokenizer_max_length,
+            max_length=self.config.tokenizer_max_length, #200
             padding="max_length",
             truncation=True,
             return_tensors="pt",
@@ -1374,7 +1388,7 @@ class PI05Policy(PreTrainedPolicy):
         
         # Update batch with new tokens
         stacked_batch[OBS_LANGUAGE_TOKENS] = tokenized["input_ids"].to(device)
-        stacked_batch[OBS_LANGUAGE_ATTENTION_MASK] = tokenized["attention_mask"].to(device)
+        stacked_batch[OBS_LANGUAGE_ATTENTION_MASK] = tokenized["attention_mask"].to(device).to(dtype=torch.bool)
         
         return stacked_batch
 
