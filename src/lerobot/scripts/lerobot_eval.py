@@ -540,6 +540,11 @@ def eval_main(cfg: EvalPipelineConfig):
         # Disable queue filling augmentation during inference (only used during training)
         "pi05_queue_filling_augmentation": {"aug_prob": 0.0},
     }
+    # Override tokenizer max_length from policy config (for pi05, pi0, smolvla etc.)
+    if hasattr(policy.config, "tokenizer_max_length"):
+        preprocessor_overrides["tokenizer_processor"] = {
+            "max_length": policy.config.tokenizer_max_length,
+        }
 
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,

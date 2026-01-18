@@ -347,6 +347,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         processor_kwargs["preprocessor_overrides"]["rename_observations_processor"] = {
             "rename_map": cfg.rename_map
         }
+        # Override tokenizer max_length from policy config (for pi05, pi0, smolvla etc.)
+        if hasattr(policy.config, "tokenizer_max_length"):
+            processor_kwargs["preprocessor_overrides"]["tokenizer_processor"] = {
+                "max_length": policy.config.tokenizer_max_length,
+            }
         postprocessor_kwargs["postprocessor_overrides"] = {
             "unnormalizer_processor": {
                 "stats": dataset.meta.stats,

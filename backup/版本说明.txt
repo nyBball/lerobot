@@ -1,2 +1,4 @@
 v0：支持多时间步训推
-v1: 在v0基础上，修复训推机械臂state输入不一致问题，训练时引入随机填充策略，保证多时间步的image和state一致，模拟推理首时间步场景
+v1: 在v0基础上，修复训推机械臂state输入不一致问题；
+训练时引入随机填充策略，保证多时间步的image和state一致，模拟推理首时间步场景；
+支持修改configuration_pi05中的tokenizer_max_length
