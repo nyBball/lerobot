@@ -252,13 +252,13 @@ def make_pi05_pre_post_processors(
     input_steps: list[ProcessorStep] = [
         RenameObservationsProcessorStep(rename_map={}),  # To mimic the same processor as pretrained one
         AddBatchDimensionProcessorStep(),
-        # Queue filling augmentation: simulates inference-time queue filling during training
-        # Must come before normalization to work on raw observations
-        Pi05QueueFillingAugmentationStep(
-            aug_prob=config.queue_filling_aug_prob,
-            n_obs_steps=config.n_obs_steps,
-            image_feature_keys=image_feature_keys,
-        ),
+        # # Queue filling augmentation: simulates inference-time queue filling during training
+        # # Must come before normalization to work on raw observations
+        # Pi05QueueFillingAugmentationStep(
+        #     aug_prob=config.queue_filling_aug_prob,
+        #     n_obs_steps=config.n_obs_steps,
+        #     image_feature_keys=image_feature_keys,
+        # ),
         # NOTE: NormalizerProcessorStep MUST come before Pi05PrepareStateTokenizerProcessorStep
         # because the tokenizer step expects normalized state in [-1, 1] range for discretization
         NormalizerProcessorStep(
@@ -266,6 +266,7 @@ def make_pi05_pre_post_processors(
             norm_map=config.normalization_mapping,
             stats=dataset_stats,
         ),
+        # Pi05PreserveNormalizedStateProcessorStep(),
         Pi05PrepareStateTokenizerProcessorStep(max_state_dim=config.max_state_dim),
         TokenizerProcessorStep(
             tokenizer_name="google/paligemma-3b-pt-224",
