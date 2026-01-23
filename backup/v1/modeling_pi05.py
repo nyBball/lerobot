@@ -1121,6 +1121,8 @@ class PI05Policy(PreTrainedPolicy):
             # So we need to store at least 16 frames (indices 0 to 15 from oldest)
             queue_size = (self.config.n_obs_steps - 1) * self.config.obs_frame_interval + 1
             self._queues[OBS_STATE] = deque(maxlen=queue_size)
+            # Add queue for normalized state (for re-tokenization after stacking)
+            self._queues[NORMALIZED_STATE_KEY] = deque(maxlen=queue_size)
             for key in self.config.image_features:
                 self._queues[key] = deque(maxlen=queue_size)
 
@@ -1140,9 +1142,10 @@ class PI05Policy(PreTrainedPolicy):
     def _rtc_enabled(self) -> bool:
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
 
-    
-    def _preprocess_images(self, batch: dict[str, Tensor]) -> tuple[list[Tensor], list[Tensor]]:
+    def _preprocess_images_camera_first(self, batch: dict[str, Tensor]) -> tuple[list[Tensor], list[Tensor]]:
         """Preprocess images for the model.
+
+        [cam1_t0, cam1_t1, cam1_t2, cam1_t3, cam2_t0, cam2_t1, cam2_t2, cam2_t3]
 
         Images from LeRobot are typically in [B, C, H, W] format and normalized to [0, 1].
         For n_obs_steps > 1, images come in [B, n_obs_steps, C, H, W] format.
@@ -1204,6 +1207,96 @@ class PI05Policy(PreTrainedPolicy):
             mask = torch.zeros(images[-1].shape[0], dtype=torch.bool, device=device)  # Mask is zero for empty cameras
             images.append(img)
             img_masks.append(mask)
+
+        return images, img_masks
+
+    
+    def _preprocess_images_time_first(self, batch: dict[str, Tensor]) -> tuple[list[Tensor], list[Tensor]]:
+        """Preprocess images for the model.
+
+        Images from LeRobot are typically in [B, C, H, W] format and normalized to [0, 1].
+        For n_obs_steps > 1, images come in [B, n_obs_steps, C, H, W] format.
+        PaliGemma expects images in [B, C, H, W] format and normalized to [-1, 1].
+        
+        When n_obs_steps > 1, images are ordered by timestep first (time-major order):
+        [cam1_t0, cam2_t0, cam1_t1, cam2_t1, ...] instead of camera-first order.
+        This matches the openpi implementation.
+        """
+        images = []
+        img_masks = []
+
+        # Get device from model parameters
+        device = next(self.parameters()).device
+
+        present_img_keys = [key for key in self.config.image_features if key in batch]
+        missing_img_keys = [key for key in self.config.image_features if key not in batch]
+
+        if len(present_img_keys) == 0:
+            raise ValueError(
+                f"All image features are missing from the batch. At least one expected. "
+                f"(batch: {batch.keys()}) (image_features: {self.config.image_features})"
+            )
+
+        # Check if we have multi-step observations
+        first_img = batch[present_img_keys[0]]
+        is_multi_step = first_img.dim() == 5  # [B, n_obs_steps, C, H, W]
+
+        if is_multi_step:
+            # Time-major ordering: iterate over timesteps first, then cameras
+            # Result: [cam1_t0, cam2_t0, cam1_t1, cam2_t1, cam1_t2, cam2_t2, ...]
+            batch_size, n_obs_steps = first_img.shape[:2]
+            
+            for step_idx in range(n_obs_steps):
+                for key in present_img_keys:
+                    img = batch[key]
+                    
+                    # Ensure tensor is on the same device as the model
+                    if img.device != device:
+                        img = img.to(device)
+                    
+                    # Ensure float32 dtype for consistency
+                    if img.dtype != torch.float32:
+                        img = img.to(torch.float32)
+                    
+                    step_img = img[:, step_idx]  # [B, C, H, W]
+                    step_img = self._preprocess_single_image(step_img, device)
+                    images.append(step_img)
+                    # Create mask (all ones for real images)
+                    mask = torch.ones(batch_size, dtype=torch.bool, device=device)
+                    img_masks.append(mask)
+                
+                # Add empty cameras for this timestep
+                for _num_empty_cameras in range(len(missing_img_keys)):
+                    img = torch.ones_like(images[-1]) * -1  # Padded with -1 for SigLIP
+                    mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
+                    images.append(img)
+                    img_masks.append(mask)
+        else:
+            # Single step observation: [B, C, H, W]
+            for key in present_img_keys:
+                img = batch[key]
+                
+                # Ensure tensor is on the same device as the model
+                if img.device != device:
+                    img = img.to(device)
+                
+                # Ensure float32 dtype for consistency
+                if img.dtype != torch.float32:
+                    img = img.to(torch.float32)
+                
+                img = self._preprocess_single_image(img, device)
+                images.append(img)
+                # Create mask (all ones for real images)
+                bsize = img.shape[0]
+                mask = torch.ones(bsize, dtype=torch.bool, device=device)
+                img_masks.append(mask)
+            
+            # Create image features not present in the batch as fully 0 padded images
+            for _num_empty_cameras in range(len(missing_img_keys)):
+                img = torch.ones_like(images[-1]) * -1  # Padded with -1 for SigLIP
+                mask = torch.zeros(images[-1].shape[0], dtype=torch.bool, device=device)
+                images.append(img)
+                img_masks.append(mask)
 
         return images, img_masks
 
@@ -1380,9 +1473,10 @@ class PI05Policy(PreTrainedPolicy):
         tokenizer = AutoTokenizer.from_pretrained("/home/ma-user/work/nieying/ckpt/paligemma-3b-pt-224")
         tokenized = tokenizer(
             full_prompts,
-            max_length=self.config.tokenizer_max_length, #200
+            max_length=self.config.tokenizer_max_length,
             padding="max_length",
             truncation=True,
+            padding_side="right",
             return_tensors="pt",
         )
         
@@ -1398,7 +1492,7 @@ class PI05Policy(PreTrainedPolicy):
         self.eval()
 
         # Prepare inputs
-        images, img_masks = self._preprocess_images(batch)
+        images, img_masks = self._preprocess_images_camera_first(batch)
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         # Sample actions using the model (pass through RTC kwargs, no separate state needed for PI05)
@@ -1420,7 +1514,7 @@ class PI05Policy(PreTrainedPolicy):
                 - "none": Return per-sample losses of shape (batch_size,) for RA-BC weighting
         """
         # Prepare inputs
-        images, img_masks = self._preprocess_images(batch)
+        images, img_masks = self._preprocess_images_camera_first(batch)
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         actions = self.prepare_action(batch)

@@ -18,9 +18,10 @@ accelerate launch --num_processes 8 --mixed_precision bf16 /home/work/src/lerobo
     --policy.compile_model=false\
     --policy.gradient_checkpointing=true\
     --policy.dtype=bfloat16\
-    --policy.n_obs_steps=4\
-    --policy.obs_frame_interval=5\
-    --policy.queue_filling_aug_prob=0.3\
+    --policy.n_obs_steps=2\
+    --policy.obs_frame_interval=1\
+    --policy.queue_filling_aug_prob=0\
+    --policy.tokenizer_max_length=300\
     --steps=30000\
     --policy.device=cuda\
     --batch_size=32\
